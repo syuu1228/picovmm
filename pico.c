@@ -4,6 +4,7 @@
 #include <linux/miscdevice.h>
 #include <linux/mm.h>
 #include <linux/fs.h>
+#include <asm/processor.h>
 
 MODULE_AUTHOR("Takuya ASADA");
 MODULE_DESCRIPTION("tiny VMM implementation");
@@ -59,6 +60,19 @@ static struct miscdevice pico_dev = {
 static int pico_init(void)
 {
 	int err = 0;
+	unsigned long ecx;
+	u64 msr;
+
+	ecx = cpuid_ecx(1);
+	if (test_bit(5, &ecx)) {
+		printk(KERN_ERR "pico: VT-x is not supported\n");
+		return -EOPNOTSUPP;
+	}
+	rdmsrl(MSR_IA32_FEATURE_CONTROL, msr);
+	if ((msr & 5) == 1) {
+		printk(KERN_ERR "pico: VT-x disabled\n");
+		return -EOPNOTSUPP;
+	}
 	err = misc_register(&pico_dev);
 	if (err) {
 		printk(KERN_ERR "pico: cannot register device\n");
