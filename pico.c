@@ -21,7 +21,7 @@
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
-#include <linux/miscdevice.h>
+#include <linux/cdev.h>
 #include <linux/mm.h>
 #include <linux/fs.h>
 #include <asm/processor.h>
@@ -33,24 +33,42 @@ MODULE_AUTHOR("Takuya ASADA");
 MODULE_DESCRIPTION("KVM like tiny VMM implementation for an education");
 MODULE_LICENSE("GPL");
 
+#define MINOR_COUNT 99
+
 struct vmcs {
 	u32 revision_id;
 	u32 abort;
 	char data[0];
 };
 
+static dev_t dev_id;
+static struct cdev c_dev;
 static int vmcs_size, vmcs_order;
 static u32 vmcs_revision_id;
 static struct vmcs *vmcs;
 
-static inline void vmxon(u64 paddr)
+static inline void vmxon(struct vmcs *vmcs)
 {
-	asm volatile ("vmxon %0" : : "m"(paddr) : "memory", "cc");
+	u64 phys_addr = __pa(vmcs);
+
+	asm volatile ("vmxon %0" : : "m"(phys_addr) : "memory", "cc");
 }
 
 static inline void vmxoff(void)
 {
 	asm volatile ("vmxoff" : : : "cc");
+}
+
+static inline void vmclear(struct vmcs *vmcs)
+{
+	u64 phys_addr = __pa(vmcs);
+	u8 error;
+
+	asm volatile ("vmclear %1; setna %0"
+		       : "=m"(error) : "m"(phys_addr) : "cc", "memory" );
+	if (error)
+		printk(KERN_ERR "kvm: vmclear fail: %p/%llx\n",
+		       vmcs, phys_addr);
 }
 
 static int pico_dev_open(struct inode *inode, struct file *filp)
@@ -75,29 +93,23 @@ static int pico_dev_fault(struct vm_area_struct *vma,
 	return 0;
 }
 
-static struct vm_operations_struct pico_dev_vm_ops = {
+static struct vm_operations_struct pico_vm_ops = {
 	.fault = pico_dev_fault,
 };
 
 static int pico_dev_mmap(struct file *file, struct vm_area_struct *vma)
 {
-	vma->vm_ops = &pico_dev_vm_ops;
+	vma->vm_ops = &pico_vm_ops;
 	return 0;
 }
 
-static struct file_operations pico_chardev_ops = {
+static struct file_operations pico_file_ops = {
 	.owner		= THIS_MODULE,
 	.open		= pico_dev_open,
 	.release        = pico_dev_release,
 	.unlocked_ioctl = pico_dev_ioctl,
 	.compat_ioctl   = pico_dev_ioctl,
 	.mmap           = pico_dev_mmap,
-};
-
-static struct miscdevice pico_dev = {
-	MISC_DYNAMIC_MINOR,
-	"pico",
-	&pico_chardev_ops,
 };
 
 static __init int cpu_has_vmx_support(void)
@@ -140,7 +152,6 @@ static __init int alloc_vmcs(void)
 
 static __init void vmx_enable(void)
 {
-	u64 phys_addr = __pa(vmcs);
 	u64 old;
 
 	rdmsrl(MSR_IA32_FEATURE_CONTROL, old);
@@ -148,7 +159,7 @@ static __init void vmx_enable(void)
 		/* enable and lock */
 		wrmsrl(MSR_IA32_FEATURE_CONTROL, old | 5);
 	write_cr4(read_cr4() | X86_CR4_VMXE); /* FIXME: not cpu hotplug safe */
-	vmxon(phys_addr);
+	vmxon(vmcs);
 }
 
 static __exit void vmx_disable(void)
@@ -179,19 +190,32 @@ static __init int pico_init(void)
 
 	vmx_enable();
 
-	r = misc_register(&pico_dev);
-	if (r) {
-		printk (KERN_ERR "pico: misc device register failed\n");
+	r = alloc_chrdev_region(&dev_id, 0, MINOR_COUNT, "pico");
+	if (r < 0) {
+		printk (KERN_ERR "pico: device allocation failed\n");
 		return r;
 	}
+	
+	cdev_init(&c_dev, &pico_file_ops);
+	c_dev.owner = THIS_MODULE;
+
+	r = cdev_add(&c_dev, dev_id, 1);
+	if (r) {
+		printk (KERN_ERR "pico: device add failed\n");
+	}
+	
+	printk(KERN_INFO "pico is loaded\n");
+	printk(KERN_INFO "pico: major=%d minor=%d\n", MAJOR(dev_id), MINOR(dev_id));
 
 	return 0;
 }
 
 static __exit void pico_exit(void)
 {
-	misc_deregister(&pico_dev);
+	cdev_del(&c_dev);
+	unregister_chrdev_region(dev_id, MINOR_COUNT);
 	vmx_disable();
+	printk(KERN_INFO "pico is unloaded\n");
 }
 
 module_init(pico_init);
