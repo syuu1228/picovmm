@@ -159,7 +159,7 @@ static __init int pico_init(void)
 {
 	int r = 0;
 
-	if (cpu_has_vmx_support()) {
+	if (!cpu_has_vmx_support()) {
 		printk(KERN_ERR "pico: no hardware support\n");
 		return -EOPNOTSUPP;
 	}
