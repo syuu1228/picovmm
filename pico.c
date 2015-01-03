@@ -24,6 +24,7 @@
 #include <linux/cdev.h>
 #include <linux/mm.h>
 #include <linux/fs.h>
+#include <linux/device.h>
 #include <asm/processor.h>
 #include <asm/processor-flags.h>
 #include <asm/msr-index.h>
@@ -33,7 +34,7 @@ MODULE_AUTHOR("Takuya ASADA");
 MODULE_DESCRIPTION("KVM like tiny VMM implementation for an education");
 MODULE_LICENSE("GPL");
 
-#define MINOR_COUNT 99
+#define MINOR_COUNT 1
 
 struct vmcs {
 	u32 revision_id;
@@ -43,6 +44,7 @@ struct vmcs {
 
 static dev_t dev_id;
 static struct cdev c_dev;
+static struct class *cl;
 static int vmcs_size, vmcs_order;
 static u32 vmcs_revision_id;
 static struct vmcs *vmcs;
@@ -150,6 +152,11 @@ static __init int alloc_vmcs(void)
 	return 0;
 }
 
+static void free_vmcs(void)
+{
+	free_pages((unsigned long)vmcs, vmcs_order);
+}
+
 static __init void vmx_enable(void)
 {
 	u64 old;
@@ -169,7 +176,8 @@ static __exit void vmx_disable(void)
 
 static __init int pico_init(void)
 {
-	int r = 0;
+	int r;
+	static struct device *dev;
 
 	if (!cpu_has_vmx_support()) {
 		printk(KERN_ERR "pico: no hardware support\n");
@@ -185,36 +193,63 @@ static __init int pico_init(void)
 
 	if (alloc_vmcs()) {
 		printk(KERN_ERR "pico: page allocation failed\n");
-		return -ENOMEM;
+		goto err_vmcs;
 	}
 
 	vmx_enable();
 
 	r = alloc_chrdev_region(&dev_id, 0, MINOR_COUNT, "pico");
 	if (r < 0) {
-		printk (KERN_ERR "pico: device allocation failed\n");
-		return r;
+		printk(KERN_ERR "pico: device allocation failed\n");
+		goto err_chrdev;
+	}
+
+	cl = class_create(THIS_MODULE, "pico");
+	if (!cl) {
+		printk(KERN_ERR "pico: class creation failed\n");
+		goto err_class;
 	}
 	
+	dev = device_create(cl, NULL, dev_id, NULL, "pico");
+	if (!dev) {
+		printk(KERN_ERR "pico: device creation failed\n");
+		goto err_dev;
+	}
+
 	cdev_init(&c_dev, &pico_file_ops);
 	c_dev.owner = THIS_MODULE;
 
 	r = cdev_add(&c_dev, dev_id, 1);
 	if (r) {
-		printk (KERN_ERR "pico: device add failed\n");
+		printk(KERN_ERR "pico: cdev add failed\n");
+		goto err_add;
 	}
 	
 	printk(KERN_INFO "pico is loaded\n");
 	printk(KERN_INFO "pico: major=%d minor=%d\n", MAJOR(dev_id), MINOR(dev_id));
-
 	return 0;
+
+err_add:
+	device_destroy(cl, dev_id);
+err_dev:
+	class_destroy(cl);
+err_class:
+	unregister_chrdev_region(dev_id, MINOR_COUNT);
+err_chrdev:
+	vmx_disable();
+err_vmcs:
+	free_vmcs();
+	return -1;
 }
 
 static __exit void pico_exit(void)
 {
 	cdev_del(&c_dev);
+	device_destroy(cl, dev_id);
+	class_destroy(cl);
 	unregister_chrdev_region(dev_id, MINOR_COUNT);
 	vmx_disable();
+	free_vmcs();
 	printk(KERN_INFO "pico is unloaded\n");
 }
 
