@@ -27,6 +27,7 @@
 #include <asm/processor.h>
 #include <asm/processor-flags.h>
 #include <asm/msr-index.h>
+#include "pico.h"
 
 MODULE_AUTHOR("Takuya ASADA");
 MODULE_DESCRIPTION("KVM like tiny VMM implementation for an education");
