@@ -32,8 +32,15 @@ MODULE_AUTHOR("Takuya ASADA");
 MODULE_DESCRIPTION("KVM like tiny VMM implementation for an education");
 MODULE_LICENSE("GPL");
 
+struct vmcs {
+	u32 revision_id;
+	u32 abort;
+	char data[0];
+};
+
 static int vmcs_size, vmcs_order;
 static u32 vmcs_revision_id;
+static struct vmcs *vmcs;
 
 static inline void vmxon(u64 paddr)
 {
@@ -106,19 +113,6 @@ static __init int vmx_disabled_by_bios(void)
 	return (msr & 5) == 1; /* locked but not enabled */
 }
 
-static __init void vmx_enable(void *vmxarea)
-{
-	u64 phys_addr = __pa(vmxarea);
-	u64 old;
-
-	rdmsrl(MSR_IA32_FEATURE_CONTROL, old);
-	if ((old & 5) == 0)
-		/* enable and lock */
-		wrmsrl(MSR_IA32_FEATURE_CONTROL, old | 5);
-	write_cr4(read_cr4() | X86_CR4_VMXE); /* FIXME: not cpu hotplug safe */
-	vmxon(phys_addr);
-}
-
 static __init void load_vmx_basic_msr(void)
 {
 	u32 vmx_msr_low, vmx_msr_high;
@@ -129,6 +123,38 @@ static __init void load_vmx_basic_msr(void)
 	vmcs_revision_id = vmx_msr_low;
 };
 
+static __init int alloc_vmcs(void)
+{
+	int node = cpu_to_node(smp_processor_id());
+	struct page *pages;
+
+	pages = alloc_pages_node(node, GFP_KERNEL, vmcs_order);
+	if (!pages)
+		return -1;
+	vmcs = page_address(pages);
+	memset(vmcs, 0, vmcs_size);
+	vmcs->revision_id = vmcs_revision_id; /* vmcs revision id */
+	return 0;
+}
+
+static __init void vmx_enable(void)
+{
+	u64 phys_addr = __pa(vmcs);
+	u64 old;
+
+	rdmsrl(MSR_IA32_FEATURE_CONTROL, old);
+	if ((old & 5) == 0)
+		/* enable and lock */
+		wrmsrl(MSR_IA32_FEATURE_CONTROL, old | 5);
+	write_cr4(read_cr4() | X86_CR4_VMXE); /* FIXME: not cpu hotplug safe */
+	vmxon(phys_addr);
+}
+
+static __exit void vmx_disable(void)
+{
+	vmxoff();
+}
+
 static __init int pico_init(void)
 {
 	int r = 0;
@@ -137,14 +163,20 @@ static __init int pico_init(void)
 		printk(KERN_ERR "pico: no hardware support\n");
 		return -EOPNOTSUPP;
 	}
+
 	if (vmx_disabled_by_bios()) {
 		printk(KERN_ERR "pico: disabled by bios\n");
 		return -EOPNOTSUPP;
 	}
-	
+
 	load_vmx_basic_msr();
 
-	vmx_enable(NULL);
+	if (alloc_vmcs()) {
+		printk(KERN_ERR "pico: page allocation failed\n");
+		return -ENOMEM;
+	}
+
+	vmx_enable();
 
 	r = misc_register(&pico_dev);
 	if (r) {
@@ -158,6 +190,7 @@ static __init int pico_init(void)
 static __exit void pico_exit(void)
 {
 	misc_deregister(&pico_dev);
+	vmx_disable();
 }
 
 module_init(pico_init);
