@@ -1,7 +1,19 @@
 /*
- * picovmm
+ * Kernel-based Virtual Machine driver for Linux
+ *
+ * This module enables machines with Intel VT-x extensions to run virtual
+ * machines without emulation or binary translation.
  *
  * Copyright (C) 2006 Qumranet, Inc.
+ *
+ * Authors:
+ *   Avi Kivity   <avi@qumranet.com>
+ *   Yaniv Kamay  <yaniv@qumranet.com>
+ *
+ */
+/*
+ * picovmm
+ *
  * Copyright (C) 2015 Takuya ASADA
  *
  */
@@ -17,17 +29,11 @@
 #include <asm/msr-index.h>
 
 MODULE_AUTHOR("Takuya ASADA");
-MODULE_DESCRIPTION("tiny VMM implementation");
+MODULE_DESCRIPTION("KVM like tiny VMM implementation for an education");
 MODULE_LICENSE("GPL");
 
-struct vmcs {
-	u32 revision_id;
-	u32 abort;
-	char data[0];
-};
-
-static int size, order;
-static u32 revision_id;
+static int vmcs_size, vmcs_order;
+static u32 vmcs_revision_id;
 
 static inline void vmxon(u64 paddr)
 {
@@ -86,38 +92,64 @@ static struct miscdevice pico_dev = {
 	&pico_chardev_ops,
 };
 
-static int pico_init(void)
+static __init int cpu_has_vmx_support(void)
 {
-	int err = 0;
-	unsigned long ecx;
-	u64 msrl;
-	u32 msr_low, msr_high;
+	unsigned long ecx = cpuid_ecx(1);
+	return test_bit(5, &ecx); /* CPUID.1:ECX.VMX[bit 5] -> VT */
+}
 
-	ecx = cpuid_ecx(1);
-	if (test_bit(5, &ecx)) {
-		printk(KERN_ERR "pico: VT-x is not supported\n");
+static __init int vmx_disabled_by_bios(void)
+{
+	u64 msr;
+
+	rdmsrl(MSR_IA32_FEATURE_CONTROL, msr);
+	return (msr & 5) == 1; /* locked but not enabled */
+}
+
+static __init void vmx_enable(void *vmxarea)
+{
+	u64 phys_addr = __pa(vmxarea);
+	u64 old;
+
+	rdmsrl(MSR_IA32_FEATURE_CONTROL, old);
+	if ((old & 5) == 0)
+		/* enable and lock */
+		wrmsrl(MSR_IA32_FEATURE_CONTROL, old | 5);
+	write_cr4(read_cr4() | X86_CR4_VMXE); /* FIXME: not cpu hotplug safe */
+	vmxon(phys_addr);
+}
+
+static __init void load_vmx_basic_msr(void)
+{
+	u32 vmx_msr_low, vmx_msr_high;
+
+	rdmsr(MSR_IA32_VMX_BASIC, vmx_msr_low, vmx_msr_high);
+	vmcs_size = vmx_msr_high & 0x1fff;
+	vmcs_order = get_order(vmcs_size);
+	vmcs_revision_id = vmx_msr_low;
+};
+
+static __init int pico_init(void)
+{
+	int r = 0;
+
+	if (cpu_has_vmx_support()) {
+		printk(KERN_ERR "pico: no hardware support\n");
 		return -EOPNOTSUPP;
 	}
-
-	rdmsrl(MSR_IA32_FEATURE_CONTROL, msrl);
-	if ((msrl & 5) == 1) {
-		printk(KERN_ERR "pico: VT-x disabled\n");
+	if (vmx_disabled_by_bios()) {
+		printk(KERN_ERR "pico: disabled by bios\n");
 		return -EOPNOTSUPP;
-	} else if ((msrl & 5) == 0) {
-		wrmsrl(MSR_IA32_FEATURE_CONTROL, msrl | 5);
 	}
+	
+	load_vmx_basic_msr();
 
-	write_cr4(read_cr4() | X86_CR4_VMXE);
+	vmx_enable(NULL);
 
-	rdmsr(MSR_IA32_VMX_BASIC, msr_low, msr_high);
-	size = msr_high & 0x1ffff;
-	order = get_order(size);
-	revision_id = msr_low;
-
-	err = misc_register(&pico_dev);
-	if (err) {
-		printk(KERN_ERR "pico: cannot register device\n");
-		return err;
+	r = misc_register(&pico_dev);
+	if (r) {
+		printk (KERN_ERR "pico: misc device register failed\n");
+		return r;
 	}
 
 	return 0;
