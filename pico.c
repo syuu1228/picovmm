@@ -598,6 +598,7 @@ static __init void vmx_enable(struct vmcs *vmcs)
 		wrmsrl(MSR_IA32_FEATURE_CONTROL, old | 5);
 	write_cr4(read_cr4() | X86_CR4_VMXE); /* FIXME: not cpu hotplug safe */
 	vmxon(vmcs);
+	vmptrld(vmcs);
 }
 
 static void vmx_disable(void)
