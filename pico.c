@@ -45,34 +45,12 @@ struct vmcs {
 	char data[0];
 };
 
-enum {
-	VCPU_REGS_RAX = 0,
-	VCPU_REGS_RCX = 1,
-	VCPU_REGS_RDX = 2,
-	VCPU_REGS_RBX = 3,
-	VCPU_REGS_RSP = 4,
-	VCPU_REGS_RBP = 5,
-	VCPU_REGS_RSI = 6,
-	VCPU_REGS_RDI = 7,
-	VCPU_REGS_R8 = 8,
-	VCPU_REGS_R9 = 9,
-	VCPU_REGS_R10 = 10,
-	VCPU_REGS_R11 = 11,
-	VCPU_REGS_R12 = 12,
-	VCPU_REGS_R13 = 13,
-	VCPU_REGS_R14 = 14,
-	VCPU_REGS_R15 = 15,
-	NR_VCPU_REGS
-};
-
 struct vcpu_state {
 	int   launched;
 	unsigned long regs[NR_VCPU_REGS]; /* for rsp: vcpu_load_rsp_rip() */
 	unsigned long rip;      /* needs vcpu_load_rsp_rip() */
 
 	unsigned long cr2;
-	unsigned long cr3;
-	unsigned long cr8;
 };
 
 struct descriptor_table {
@@ -421,42 +399,120 @@ static int pico_dev_ioctl_vmentry(struct vcpu_state *vcpu)
 static long pico_dev_ioctl(struct file *filp,
 			  unsigned int ioctl, unsigned long arg)
 {
+	struct vcpu_state *vcpu = vcpu0;
 	long r = -EINVAL;
 
 	switch (ioctl) {
 	case PICO_VMENTRY:
-		r = pico_dev_ioctl_vmentry(vcpu0);
+		r = pico_dev_ioctl_vmentry(vcpu);
 		break;
 	case PICO_VMCS_READ: {
-		struct pico_vmcs_arg vmcs_arg;
+		struct pico_reg reg;
 
 		r = -EFAULT;
-		if (copy_from_user(&vmcs_arg, (void *)arg, sizeof vmcs_arg))
+		if (copy_from_user(&reg, (void *)arg, sizeof reg))
 			goto out;
-		r = vmcs_read(vmcs_arg.field, &vmcs_arg.value);
+		r = vmcs_read(reg.field, &reg.value);
 		if (r)
 			goto out;
 		r = -EFAULT;
-		if (copy_to_user((void *)arg, &vmcs_arg, sizeof vmcs_arg))
+		if (copy_to_user((void *)arg, &reg, sizeof reg))
 			goto out;
 		r = 0;
 		break;
 	}
 	case PICO_VMCS_WRITE: {
-		struct pico_vmcs_arg vmcs_arg;
+		struct pico_reg reg;
 
 		r = -EFAULT;
-		if (copy_from_user(&vmcs_arg, (void *)arg, sizeof vmcs_arg))
+		if (copy_from_user(&reg, (void *)arg, sizeof reg))
 			goto out;
-		r = vmcs_write(vmcs_arg.field, vmcs_arg.value);
+		r = vmcs_write(reg.field, reg.value);
 		if (r)
 			goto out;
 		r = -EFAULT;
-		if (copy_to_user((void *)arg, &vmcs_arg, sizeof vmcs_arg))
+		if (copy_to_user((void *)arg, &reg, sizeof reg))
 			goto out;
 		r = 0;
 		break;
 	}
+	case PICO_REG_READ: {
+		struct pico_reg reg;
+
+		r = -EFAULT;
+		if (copy_from_user(&reg, (void *)arg, sizeof reg))
+			goto out;
+		if (reg.field >= NR_VCPU_REGS) {
+			r = -EINVAL;
+			goto out;
+		}
+		reg.value = vcpu->regs[reg.field];
+		r = -EFAULT;
+		if (copy_to_user((void *)arg, &reg, sizeof reg))
+			goto out;
+		r = 0;
+		break;
+	}
+	case PICO_REG_WRITE: {
+		struct pico_reg reg;
+
+		r = -EFAULT;
+		if (copy_from_user(&reg, (void *)arg, sizeof reg))
+			goto out;
+		if (reg.field >= NR_VCPU_REGS) {
+			r = -EINVAL;
+			goto out;
+		}
+		vcpu->regs[reg.field] = reg.value;
+		r = -EFAULT;
+		if (copy_to_user((void *)arg, &reg, sizeof reg))
+			goto out;
+		r = 0;
+		break;
+	}
+	case PICO_CREG_READ: {
+		struct pico_reg reg;
+
+		r = -EFAULT;
+		if (copy_from_user(&reg, (void *)arg, sizeof reg))
+			goto out;
+		switch (reg.field) {
+		case 2:
+			reg.value = vcpu->cr2;
+			r = 0;
+			break;
+		default:
+			r = -EINVAL;
+			goto out;
+		}
+		r = -EFAULT;
+		if (copy_to_user((void *)arg, &reg, sizeof reg))
+			goto out;
+		r = 0;
+		break;
+	}
+	case PICO_CREG_WRITE: {
+		struct pico_reg reg;
+
+		r = -EFAULT;
+		if (copy_from_user(&reg, (void *)arg, sizeof reg))
+			goto out;
+		switch (reg.field) {
+		case 2:
+			vcpu->cr2 = reg.value;
+			r = 0;
+			break;
+		default:
+			r = -EINVAL;
+			goto out;
+		}
+		r = -EFAULT;
+		if (copy_to_user((void *)arg, &reg, sizeof reg))
+			goto out;
+		r = 0;
+		break;
+	}
+
 	}
 out:
 	return r;
