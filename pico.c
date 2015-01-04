@@ -89,6 +89,7 @@ static u32 vmcs_revision_id;
 static struct vmcs *vmcs0;
 static struct vcpu_state __vcpu0 = {0};
 static struct vcpu_state *vcpu0 = &__vcpu0;
+static struct page *page0;
 
 static inline void vmxon(struct vmcs *vmcs)
 {
@@ -608,6 +609,7 @@ static __init int pico_init(void)
 {
 	int r;
 	static struct device *dev;
+	char *instr;
 
 	if (!cpu_has_vmx_support()) {
 		printk(KERN_ERR "pico: no hardware support\n");
@@ -628,6 +630,16 @@ static __init int pico_init(void)
 	}
 
 	vmx_enable(vmcs0);
+
+	page0 = alloc_page(GFP_KERNEL);
+	if (!page0) {
+		printk(KERN_ERR "pico: page allocation failed\n");
+		goto err_chrdev;
+	}
+	instr = page_address(page0);
+	instr[0] = 0x0f;
+	instr[1] = 0xa2;
+	vmcs_writel(GUEST_RIP, (unsigned long)instr);
 
 	r = alloc_chrdev_region(&dev_id, 0, MINOR_COUNT, "pico");
 	if (r < 0) {
