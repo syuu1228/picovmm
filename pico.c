@@ -135,6 +135,7 @@ static struct class *cl;
 static int vmcs_size, vmcs_order;
 static u32 vmcs_revision_id;
 static struct vcpu_state *vcpu0;
+static struct vmcs *vmcs_init;
 
 static inline void vmxon(struct vmcs *vmcs)
 {
@@ -156,7 +157,7 @@ static inline int vmptrld(struct vmcs *vmcs)
 	asm volatile ("vmptrld %1; setna %0"
 		       : "=m"(error) : "m"(phys_addr) : "cc" );
 	if (error)
-		printk(KERN_ERR "kvm: vmptrld %p/%llx fail\n",
+		printk(KERN_ERR "pico: vmptrld %p/%llx fail\n",
 		       vmcs, phys_addr);
 	return error ? -1 : 0;
 }
@@ -169,7 +170,7 @@ static inline int vmclear(struct vmcs *vmcs)
 	asm volatile ("vmclear %1; setna %0"
 		       : "=m"(error) : "m"(phys_addr) : "cc", "memory" );
 	if (error)
-		printk(KERN_ERR "kvm: vmclear fail: %p/%llx\n",
+		printk(KERN_ERR "pico: vmclear fail: %p/%llx\n",
 		       vmcs, phys_addr);
 	return error ? -1 : 0;
 }
@@ -183,7 +184,7 @@ static inline int vmcs_read(unsigned long field, unsigned long *valuep)
 	asm volatile ("vmread %2, %1; setna %0"
 			: "=g"(error), "=g"(value) : "r"(field) : "cc");
 	if (error)
-		printk(KERN_ERR "vmread error: reg %lx (err %d)\n",
+		printk(KERN_ERR "pico: vmread error: reg %lx (err %d)\n",
 		       field, (u32)vmcs_readl(VM_INSTRUCTION_ERROR));
 
 	*valuep = value;
@@ -197,7 +198,7 @@ static inline int vmcs_write(unsigned long field, unsigned long value)
 	asm volatile ("vmwrite %1, %2; setna %0"
 		       : "=g"(error) : "r"(value), "r"(field) : "cc" );
 	if (error)
-		printk(KERN_ERR "vmwrite error: reg %lx value %lx (err %d)\n",
+		printk(KERN_ERR "pico: vmwrite error: reg %lx value %lx (err %d)\n",
 		       field, value, (u32)vmcs_readl(VM_INSTRUCTION_ERROR));
 	return error ? -1 : 0;
 }
@@ -335,6 +336,9 @@ static int pico_dev_release(struct inode *inode, struct file *filp)
 
 static int pico_vcpu_setup(struct vcpu_state *vcpu)
 {
+	vmptrld(vcpu->vmcs);
+	vmclear(vcpu->vmcs);
+#if 0
 	extern asmlinkage void pico_vmx_return(void);
 	u32 host_sysenter_cs;
 	u32 junk;
@@ -484,7 +488,7 @@ static int pico_vcpu_setup(struct vcpu_state *vcpu)
 		vcpu->guest_msrs[j] = vcpu->host_msrs[j];
 		++vcpu->nmsrs;
 	}
-	printk("msrs: %d\n", vcpu->nmsrs);
+	printk("pico: msrs: %d\n", vcpu->nmsrs);
 
 	nr_good_msrs = vcpu->nmsrs - NR_BAD_MSRS;
 	vmcs_writel(VM_ENTRY_MSR_LOAD_ADDR,
@@ -529,6 +533,8 @@ out_free_guest_msrs:
 	kfree(vcpu->guest_msrs);
 out:
 	return ret;
+#endif
+	return 0;
 }
 
 static int pico_dev_ioctl_vmentry(struct vcpu_state *vcpu)
@@ -899,7 +905,7 @@ static void free_vcpu(struct vcpu_state *vcpu)
 	kfree(vcpu);
 }
 
-static __init void vmx_enable(struct vcpu_state *vcpu)
+static __init void vmx_enable(struct vmcs *vmcs)
 {
 	u64 old;
 
@@ -908,12 +914,10 @@ static __init void vmx_enable(struct vcpu_state *vcpu)
 		/* enable and lock */
 		wrmsrl(MSR_IA32_FEATURE_CONTROL, old | 5);
 	write_cr4(read_cr4() | X86_CR4_VMXE); /* FIXME: not cpu hotplug safe */
-	vmxon(vcpu->vmcs);
-	vmclear(vcpu->vmcs);
-	vmptrld(vcpu->vmcs);
+	vmxon(vmcs);
 }
 
-static void vmx_disable(struct vcpu_state *vcpu)
+static void vmx_disable(void)
 {
 	vmxoff();
 }
@@ -935,20 +939,26 @@ static __init int pico_init(void)
 
 	load_vmx_basic_msr();
 
+	vmcs_init = alloc_vmcs();
+	if (!vmcs_init) {
+		printk(KERN_ERR "pico: vmcs allocation failed\n");
+		goto err_vmcs;
+	}
+
+	vmx_enable(vmcs_init);
+
 	vcpu0 = alloc_vcpu();
 	if (!vcpu0) {
 		printk(KERN_ERR "pico: vcpu allocation failed\n");
 		goto err_vcpu;
 	}
 
-	vmx_enable(vcpu0);
-
 	pico_vcpu_setup(vcpu0);
 
 	r = alloc_chrdev_region(&dev_id, 0, MINOR_COUNT, "pico");
 	if (r < 0) {
 		printk(KERN_ERR "pico: device allocation failed\n");
-		goto err_chrdev;
+		goto err_vcpu;
 	}
 
 	cl = class_create(THIS_MODULE, "pico");
@@ -982,10 +992,11 @@ err_dev:
 	class_destroy(cl);
 err_class:
 	unregister_chrdev_region(dev_id, MINOR_COUNT);
-err_chrdev:
-	vmx_disable(vcpu0);
-err_vcpu:
 	free_vcpu(vcpu0);
+err_vcpu:
+	vmx_disable();
+	free_vmcs(vmcs_init);
+err_vmcs:
 	return -1;
 }
 
@@ -995,7 +1006,7 @@ static __exit void pico_exit(void)
 	device_destroy(cl, dev_id);
 	class_destroy(cl);
 	unregister_chrdev_region(dev_id, MINOR_COUNT);
-	vmx_disable(vcpu0);
+	vmx_disable();
 	free_vcpu(vcpu0);
 	printk(KERN_INFO "pico is unloaded\n");
 }
