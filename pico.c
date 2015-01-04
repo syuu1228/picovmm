@@ -600,7 +600,7 @@ static __init void vmx_enable(struct vmcs *vmcs)
 	vmxon(vmcs);
 }
 
-static __exit void vmx_disable(void)
+static void vmx_disable(void)
 {
 	vmxoff();
 }
