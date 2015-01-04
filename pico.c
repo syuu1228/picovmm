@@ -261,10 +261,12 @@ static inline void get_gdt(struct descriptor_table *table)
 	asm ("sgdt %0" : "=m"(*table));
 }
 
+#if 0
 static void get_idt(struct descriptor_table *table)
 {
 	asm ("sidt %0" : "=m"(*table));
 }
+#endif
 
 static inline u16 read_fs(void)
 {
@@ -336,8 +338,6 @@ static int pico_dev_release(struct inode *inode, struct file *filp)
 
 static int pico_vcpu_setup(struct vcpu_state *vcpu)
 {
-	vmptrld(vcpu->vmcs);
-	vmclear(vcpu->vmcs);
 #if 0
 	extern asmlinkage void pico_vmx_return(void);
 	u32 host_sysenter_cs;
@@ -350,7 +350,11 @@ static int pico_vcpu_setup(struct vcpu_state *vcpu)
 	int nr_good_msrs;
 	unsigned long cr0, cr4;
 	char *instr;
+#endif
 
+	vmptrld(vcpu->vmcs);
+	vmclear(vcpu->vmcs);
+#if 0
 #define SEG_SETUP(seg) do {					\
 		vmcs_write16(GUEST_##seg##_SELECTOR, 0);	\
 		vmcs_writel(GUEST_##seg##_BASE, 0);		\
