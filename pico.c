@@ -25,6 +25,7 @@
 #include <linux/mm.h>
 #include <linux/fs.h>
 #include <linux/device.h>
+#include <linux/slab.h>
 #include <asm/processor.h>
 #include <asm/processor-flags.h>
 #include <asm/msr-index.h>
@@ -37,7 +38,43 @@ MODULE_DESCRIPTION("KVM like tiny VMM implementation for an education");
 MODULE_LICENSE("GPL");
 
 #define MINOR_COUNT 1
+
+static const u32 vmx_msr_index[] = {
+	MSR_SYSCALL_MASK, MSR_LSTAR, MSR_CSTAR, MSR_KERNEL_GS_BASE,
+	MSR_EFER, MSR_STAR,
+};
+#define NR_VMX_MSR (sizeof(vmx_msr_index) / sizeof(*vmx_msr_index))
 #define NR_BAD_MSRS 2
+
+#define MSR_IA32_VMX_PINBASED_CTLS_MSR		0x481
+#define MSR_IA32_VMX_PROCBASED_CTLS_MSR		0x482
+#define MSR_IA32_VMX_EXIT_CTLS_MSR		0x483
+#define MSR_IA32_VMX_ENTRY_CTLS_MSR		0x484
+
+#define PF_VECTOR 14
+
+#define CR0_PE_MASK (1ULL << 0)
+#define CR0_TS_MASK (1ULL << 3)
+#define CR0_NE_MASK (1ULL << 5)
+#define CR0_WP_MASK (1ULL << 16)
+#define CR0_NW_MASK (1ULL << 29)
+#define CR0_CD_MASK (1ULL << 30)
+#define CR0_PG_MASK (1ULL << 31)
+
+#define CR4_VME_MASK (1ULL << 0)
+#define CR4_PSE_MASK (1ULL << 4)
+#define CR4_PAE_MASK (1ULL << 5)
+#define CR4_PGE_MASK (1ULL << 7)
+#define CR4_VMXE_MASK (1ULL << 13)
+
+#define KVM_GUEST_CR0_MASK \
+	(CR0_PG_MASK | CR0_PE_MASK | CR0_WP_MASK | CR0_NE_MASK)
+#define KVM_VM_CR0_ALWAYS_ON KVM_GUEST_CR0_MASK
+
+#define KVM_GUEST_CR4_MASK \
+	(CR4_PSE_MASK | CR4_PAE_MASK | CR4_PGE_MASK | CR4_VMXE_MASK | CR4_VME_MASK)
+#define KVM_PMODE_VM_CR4_ALWAYS_ON (CR4_VMXE_MASK | CR4_PAE_MASK)
+#define KVM_RMODE_VM_CR4_ALWAYS_ON (CR4_VMXE_MASK | CR4_PAE_MASK | CR4_VME_MASK)
 
 struct vmcs {
 	u32 revision_id;
@@ -45,12 +82,23 @@ struct vmcs {
 	char data[0];
 };
 
+struct vmx_msr_entry {
+	u32 index;
+	u32 reserved;
+	u64 data;
+};
+
 struct vcpu_state {
+	struct vmcs *vmcs;
+	struct page *page;
 	int   launched;
 	unsigned long regs[NR_VCPU_REGS]; /* for rsp: vcpu_load_rsp_rip() */
 	unsigned long rip;      /* needs vcpu_load_rsp_rip() */
 
 	unsigned long cr2;
+	int nmsrs;
+	struct vmx_msr_entry *guest_msrs;
+	struct vmx_msr_entry *host_msrs;
 };
 
 struct descriptor_table {
@@ -86,10 +134,7 @@ static struct cdev c_dev;
 static struct class *cl;
 static int vmcs_size, vmcs_order;
 static u32 vmcs_revision_id;
-static struct vmcs *vmcs0;
-static struct vcpu_state __vcpu0 = {0};
-static struct vcpu_state *vcpu0 = &__vcpu0;
-static struct page *page0;
+static struct vcpu_state *vcpu0;
 
 static inline void vmxon(struct vmcs *vmcs)
 {
@@ -194,9 +239,30 @@ static inline void vmcs_write32(unsigned long field, u32 value)
 	vmcs_writel(field, value);
 }
 
+static inline void vmcs_write64(unsigned long field, u64 value)
+{
+	vmcs_writel(field, value);
+}
+
+static inline void vmcs_write32_fixedbits(u32 msr, u32 vmcs_field, u32 val)
+{
+	u32 msr_high, msr_low;
+
+	rdmsr(msr, msr_low, msr_high);
+
+	val &= msr_high;
+	val |= msr_low;
+	vmcs_write32(vmcs_field, val);
+}
+
 static inline void get_gdt(struct descriptor_table *table)
 {
 	asm ("sgdt %0" : "=m"(*table));
+}
+
+static void get_idt(struct descriptor_table *table)
+{
+	asm ("sidt %0" : "=m"(*table));
 }
 
 static inline u16 read_fs(void)
@@ -265,6 +331,204 @@ static int pico_dev_open(struct inode *inode, struct file *filp)
 static int pico_dev_release(struct inode *inode, struct file *filp)
 {
 	return 0;
+}
+
+static int pico_vcpu_setup(struct vcpu_state *vcpu)
+{
+	extern asmlinkage void pico_vmx_return(void);
+	u32 host_sysenter_cs;
+	u32 junk;
+	unsigned long a;
+	struct descriptor_table dt;
+	int i;
+	int ret;
+	u64 tsc;
+	int nr_good_msrs;
+	unsigned long cr0, cr4;
+	char *instr;
+
+#define SEG_SETUP(seg) do {					\
+		vmcs_write16(GUEST_##seg##_SELECTOR, 0);	\
+		vmcs_writel(GUEST_##seg##_BASE, 0);		\
+		vmcs_write32(GUEST_##seg##_LIMIT, 0xffff);	\
+		vmcs_write32(GUEST_##seg##_AR_BYTES, 0x93); 	\
+	} while (0)
+
+	vmcs_write16(GUEST_CS_SELECTOR, 0xf000);
+	vmcs_writel(GUEST_CS_BASE, 0x000f0000);
+	vmcs_write32(GUEST_CS_LIMIT, 0xffff);
+	vmcs_write32(GUEST_CS_AR_BYTES, 0x9b);
+
+	SEG_SETUP(DS);
+	SEG_SETUP(ES);
+	SEG_SETUP(FS);
+	SEG_SETUP(GS);
+	SEG_SETUP(SS);
+
+	vmcs_write16(GUEST_TR_SELECTOR, 0);
+	vmcs_writel(GUEST_TR_BASE, 0);
+	vmcs_write32(GUEST_TR_LIMIT, 0xffff);
+	vmcs_write32(GUEST_TR_AR_BYTES, 0x008b);
+
+	vmcs_write16(GUEST_LDTR_SELECTOR, 0);
+	vmcs_writel(GUEST_LDTR_BASE, 0);
+	vmcs_write32(GUEST_LDTR_LIMIT, 0xffff);
+	vmcs_write32(GUEST_LDTR_AR_BYTES, 0x00082);
+
+	vmcs_write32(GUEST_SYSENTER_CS, 0);
+	vmcs_writel(GUEST_SYSENTER_ESP, 0);
+	vmcs_writel(GUEST_SYSENTER_EIP, 0);
+
+	vmcs_writel(GUEST_RFLAGS, 0x02);
+	vmcs_writel(GUEST_RIP, 0x0);
+	vmcs_writel(GUEST_RSP, 0);
+
+	vmcs_writel(GUEST_CR3, 0);
+
+	vmcs_writel(GUEST_DR7, 0x400);
+
+	vmcs_writel(GUEST_GDTR_BASE, 0);
+	vmcs_write32(GUEST_GDTR_LIMIT, 0xffff);
+
+	vmcs_writel(GUEST_IDTR_BASE, 0);
+	vmcs_write32(GUEST_IDTR_LIMIT, 0xffff);
+
+	vmcs_write32(GUEST_ACTIVITY_STATE, 0);
+	vmcs_write32(GUEST_INTERRUPTIBILITY_INFO, 0);
+	vmcs_write32(GUEST_PENDING_DBG_EXCEPTIONS, 0);
+
+	/* I/O */
+	vmcs_write64(IO_BITMAP_A, 0);
+	vmcs_write64(IO_BITMAP_B, 0);
+
+	rdtscll(tsc);
+	vmcs_write64(TSC_OFFSET, -tsc);
+
+	vmcs_write64(VMCS_LINK_POINTER, -1ull); /* 22.3.1.5 */
+
+	/* Special registers */
+	vmcs_write64(GUEST_IA32_DEBUGCTL, 0);
+
+	/* Control */
+	vmcs_write32_fixedbits(MSR_IA32_VMX_PINBASED_CTLS_MSR,
+			       PIN_BASED_VM_EXEC_CONTROL,
+			       PIN_BASED_EXT_INTR_MASK   /* 20.6.1 */
+			       | PIN_BASED_NMI_EXITING   /* 20.6.1 */
+			);
+	vmcs_write32_fixedbits(MSR_IA32_VMX_PROCBASED_CTLS_MSR,
+			       CPU_BASED_VM_EXEC_CONTROL,
+			       CPU_BASED_HLT_EXITING         /* 20.6.2 */
+			       | CPU_BASED_CR8_LOAD_EXITING    /* 20.6.2 */
+			       | CPU_BASED_CR8_STORE_EXITING   /* 20.6.2 */
+			       | CPU_BASED_UNCOND_IO_EXITING   /* 20.6.2 */
+			       | CPU_BASED_INVDPG_EXITING
+			       | CPU_BASED_MOV_DR_EXITING
+			       | CPU_BASED_USE_TSC_OFFSETING   /* 21.3 */
+			);
+
+	vmcs_write32(EXCEPTION_BITMAP, 1 << PF_VECTOR);
+	vmcs_write32(PAGE_FAULT_ERROR_CODE_MASK, 0);
+	vmcs_write32(PAGE_FAULT_ERROR_CODE_MATCH, 0);
+	vmcs_write32(CR3_TARGET_COUNT, 0);           /* 22.2.1 */
+
+	vmcs_writel(HOST_CR0, read_cr0());  /* 22.2.3 */
+	vmcs_writel(HOST_CR4, read_cr4());  /* 22.2.3, 22.2.5 */
+	vmcs_writel(HOST_CR3, read_cr3());  /* 22.2.3  FIXME: shadow tables */
+
+	vmcs_write16(HOST_CS_SELECTOR, __KERNEL_CS);  /* 22.2.4 */
+	vmcs_write16(HOST_DS_SELECTOR, __KERNEL_DS);  /* 22.2.4 */
+	vmcs_write16(HOST_ES_SELECTOR, __KERNEL_DS);  /* 22.2.4 */
+	vmcs_write16(HOST_FS_SELECTOR, read_fs());    /* 22.2.4 */
+	vmcs_write16(HOST_GS_SELECTOR, read_gs());    /* 22.2.4 */
+	vmcs_write16(HOST_SS_SELECTOR, __KERNEL_DS);  /* 22.2.4 */
+	rdmsrl(MSR_FS_BASE, a);
+	vmcs_writel(HOST_FS_BASE, a); /* 22.2.4 */
+	rdmsrl(MSR_GS_BASE, a);
+	vmcs_writel(HOST_GS_BASE, a); /* 22.2.4 */
+
+	vmcs_write16(HOST_TR_SELECTOR, GDT_ENTRY_TSS*8);  /* 22.2.4 */
+
+	get_idt(&dt);
+	vmcs_writel(HOST_IDTR_BASE, dt.base);   /* 22.2.4 */
+
+
+	vmcs_writel(HOST_RIP, (unsigned long)pico_vmx_return); /* 22.2.5 */
+
+	rdmsr(MSR_IA32_SYSENTER_CS, host_sysenter_cs, junk);
+	vmcs_write32(HOST_IA32_SYSENTER_CS, host_sysenter_cs);
+	rdmsrl(MSR_IA32_SYSENTER_ESP, a);
+	vmcs_writel(HOST_IA32_SYSENTER_ESP, a);   /* 22.2.3 */
+	rdmsrl(MSR_IA32_SYSENTER_EIP, a);
+	vmcs_writel(HOST_IA32_SYSENTER_EIP, a);   /* 22.2.3 */
+
+	ret = -ENOMEM;
+	vcpu->guest_msrs = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!vcpu->guest_msrs)
+		goto out;
+	vcpu->host_msrs = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!vcpu->host_msrs)
+		goto out_free_guest_msrs;
+
+	for (i = 0; i < NR_VMX_MSR; ++i) {
+		u32 index = vmx_msr_index[i];
+		u32 data_low, data_high;
+		u64 data;
+		int j = vcpu->nmsrs;
+
+		if (rdmsr_safe(index, &data_low, &data_high) < 0)
+			continue;
+		data = data_low | ((u64)data_high << 32);
+		vcpu->host_msrs[j].index = index;
+		vcpu->host_msrs[j].reserved = 0;
+		vcpu->host_msrs[j].data = data;
+		vcpu->guest_msrs[j] = vcpu->host_msrs[j];
+		++vcpu->nmsrs;
+	}
+	printk("msrs: %d\n", vcpu->nmsrs);
+
+	nr_good_msrs = vcpu->nmsrs - NR_BAD_MSRS;
+	vmcs_writel(VM_ENTRY_MSR_LOAD_ADDR,
+		    virt_to_phys(vcpu->guest_msrs + NR_BAD_MSRS));
+	vmcs_writel(VM_EXIT_MSR_STORE_ADDR,
+		    virt_to_phys(vcpu->guest_msrs + NR_BAD_MSRS));
+	vmcs_writel(VM_EXIT_MSR_LOAD_ADDR,
+		    virt_to_phys(vcpu->host_msrs + NR_BAD_MSRS));
+	vmcs_write32_fixedbits(MSR_IA32_VMX_EXIT_CTLS_MSR, VM_EXIT_CONTROLS,
+		     	       (1 << 9));  /* 22.2,1, 20.7.1 */
+	vmcs_write32(VM_EXIT_MSR_STORE_COUNT, nr_good_msrs); /* 22.2.2 */
+	vmcs_write32(VM_EXIT_MSR_LOAD_COUNT, nr_good_msrs);  /* 22.2.2 */
+	vmcs_write32(VM_ENTRY_MSR_LOAD_COUNT, nr_good_msrs); /* 22.2.2 */
+
+	/* 22.2.1, 20.8.1 */
+	vmcs_write32_fixedbits(MSR_IA32_VMX_ENTRY_CTLS_MSR,
+                               VM_ENTRY_CONTROLS, 0);
+	vmcs_write32(VM_ENTRY_INTR_INFO_FIELD, 0);  /* 22.2.1 */
+
+	vmcs_writel(VIRTUAL_APIC_PAGE_ADDR, 0);
+	vmcs_writel(TPR_THRESHOLD, 0);
+
+	vmcs_writel(CR0_GUEST_HOST_MASK, KVM_GUEST_CR0_MASK);
+	vmcs_writel(CR4_GUEST_HOST_MASK, KVM_GUEST_CR4_MASK);
+
+	cr0 = 0x60000010;
+	vmcs_writel(CR0_READ_SHADOW, cr0);
+	vmcs_writel(GUEST_CR0, cr0 | KVM_VM_CR0_ALWAYS_ON);
+	cr4 = 0;
+	vmcs_writel(CR4_READ_SHADOW, cr4);
+	vmcs_writel(GUEST_CR4, cr4 | KVM_PMODE_VM_CR4_ALWAYS_ON);
+
+	instr = 0x0;
+	instr[0] = 0xb0;
+	instr[1] = 0x0a;
+	instr[2] = 0xe6;
+	instr[3] = 0x60;
+
+	return ret;
+
+out_free_guest_msrs:
+	kfree(vcpu->guest_msrs);
+out:
+	return ret;
 }
 
 static int pico_dev_ioctl_vmentry(struct vcpu_state *vcpu)
@@ -437,6 +701,19 @@ static long pico_dev_ioctl(struct file *filp,
 		r = 0;
 		break;
 	}
+	case PICO_VMCS_WRITE_EXEC_CTL: {
+		struct pico_exec_ctl reg;
+
+		r = -EFAULT;
+		if (copy_from_user(&reg, (void *)arg, sizeof reg))
+			goto out;
+		vmcs_write32_fixedbits(reg.msr, reg.field, reg.value);
+		r = -EFAULT;
+		if (copy_to_user((void *)arg, &reg, sizeof reg))
+			goto out;
+		r = 0;
+		break;
+	}
 	case PICO_REG_READ: {
 		struct pico_reg reg;
 
@@ -588,7 +865,41 @@ static void free_vmcs(struct vmcs *vmcs)
 	free_pages((unsigned long)vmcs, vmcs_order);
 }
 
-static __init void vmx_enable(struct vmcs *vmcs)
+static __init struct vcpu_state *alloc_vcpu(void)
+{
+	struct vcpu_state *vcpu;
+	struct vmcs *vmcs;
+	struct page *page;
+
+	vmcs = alloc_vmcs();
+	if (!vmcs)
+		goto err_vmcs;
+	page = alloc_page(GFP_KERNEL);
+	if (!page)
+		goto err_page;
+	vcpu = kzalloc(sizeof(struct vcpu_state), GFP_KERNEL);
+	if (!vcpu)
+		goto err_vcpu;
+	vcpu->vmcs = vmcs;
+	vcpu->page = page;
+	return vcpu;
+
+err_vcpu:
+	free_page((unsigned long)page_address(page));
+err_page:
+	free_vmcs(vmcs);
+err_vmcs:
+	return NULL;
+}
+
+static void free_vcpu(struct vcpu_state *vcpu)
+{
+	free_page((unsigned long)page_address(vcpu->page));
+	free_vmcs(vcpu->vmcs);
+	kfree(vcpu);
+}
+
+static __init void vmx_enable(struct vcpu_state *vcpu)
 {
 	u64 old;
 
@@ -597,11 +908,12 @@ static __init void vmx_enable(struct vmcs *vmcs)
 		/* enable and lock */
 		wrmsrl(MSR_IA32_FEATURE_CONTROL, old | 5);
 	write_cr4(read_cr4() | X86_CR4_VMXE); /* FIXME: not cpu hotplug safe */
-	vmxon(vmcs);
-	vmptrld(vmcs);
+	vmxon(vcpu->vmcs);
+	vmclear(vcpu->vmcs);
+	vmptrld(vcpu->vmcs);
 }
 
-static void vmx_disable(void)
+static void vmx_disable(struct vcpu_state *vcpu)
 {
 	vmxoff();
 }
@@ -609,8 +921,7 @@ static void vmx_disable(void)
 static __init int pico_init(void)
 {
 	int r;
-	static struct device *dev;
-	char *instr;
+	struct device *dev;
 
 	if (!cpu_has_vmx_support()) {
 		printk(KERN_ERR "pico: no hardware support\n");
@@ -624,23 +935,15 @@ static __init int pico_init(void)
 
 	load_vmx_basic_msr();
 
-	vmcs0 = alloc_vmcs();
-	if (!vmcs0) {
-		printk(KERN_ERR "pico: page allocation failed\n");
-		goto err_vmcs;
+	vcpu0 = alloc_vcpu();
+	if (!vcpu0) {
+		printk(KERN_ERR "pico: vcpu allocation failed\n");
+		goto err_vcpu;
 	}
 
-	vmx_enable(vmcs0);
+	vmx_enable(vcpu0);
 
-	page0 = alloc_page(GFP_KERNEL);
-	if (!page0) {
-		printk(KERN_ERR "pico: page allocation failed\n");
-		goto err_chrdev;
-	}
-	instr = page_address(page0);
-	instr[0] = 0x0f;
-	instr[1] = 0xa2;
-	vmcs_writel(GUEST_RIP, (unsigned long)instr);
+	pico_vcpu_setup(vcpu0);
 
 	r = alloc_chrdev_region(&dev_id, 0, MINOR_COUNT, "pico");
 	if (r < 0) {
@@ -680,9 +983,9 @@ err_dev:
 err_class:
 	unregister_chrdev_region(dev_id, MINOR_COUNT);
 err_chrdev:
-	vmx_disable();
-err_vmcs:
-	free_vmcs(vmcs0);
+	vmx_disable(vcpu0);
+err_vcpu:
+	free_vcpu(vcpu0);
 	return -1;
 }
 
@@ -692,8 +995,8 @@ static __exit void pico_exit(void)
 	device_destroy(cl, dev_id);
 	class_destroy(cl);
 	unregister_chrdev_region(dev_id, MINOR_COUNT);
-	vmx_disable();
-	free_vmcs(vmcs0);
+	vmx_disable(vcpu0);
+	free_vcpu(vcpu0);
 	printk(KERN_INFO "pico is unloaded\n");
 }
 
