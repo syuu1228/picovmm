@@ -30,9 +30,9 @@ struct pico_reg {
 };
 
 struct pico_exec_ctl {
-	u32 msr;
-	u32 field;
-	u32 value;
+	uint32_t msr;
+	uint32_t field;
+	uint32_t value;
 };
 
 #define PICO_MAGIC		'p'
