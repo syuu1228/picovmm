@@ -29,19 +29,14 @@ struct pico_reg {
 	unsigned long value;
 };
 
-struct pico_exec_ctl {
-	uint32_t msr;
-	uint32_t field;
-	uint32_t value;
-};
-
 #define PICO_MAGIC		'p'
 #define PICO_VMENTRY		_IO(PICO_MAGIC, 0)
-#define PICO_VMCS_READ		_IOWR(PICO_MAGIC, 1, struct pico_reg)
-#define PICO_VMCS_WRITE		_IOWR(PICO_MAGIC, 2, struct pico_reg)
-#define PICO_VMCS_WRITE_EXEC_CTL _IOWR(PICO_MAGIC, 3, struct pico_exec_ctl)
+#define PICO_VMREAD		_IOWR(PICO_MAGIC, 1, struct pico_reg)
+#define PICO_VMWRITE		_IOWR(PICO_MAGIC, 2, struct pico_reg)
 #define PICO_REG_READ		_IOWR(PICO_MAGIC, 4, struct pico_reg)
 #define PICO_REG_WRITE		_IOWR(PICO_MAGIC, 5, struct pico_reg)
 #define PICO_CREG_READ		_IOWR(PICO_MAGIC, 6, struct pico_reg)
 #define PICO_CREG_WRITE		_IOWR(PICO_MAGIC, 7, struct pico_reg)
+#define PICO_RDMSR		_IOWR(PICO_MAGIC, 8, struct pico_reg)
+#define PICO_WRMSR		_IOWR(PICO_MAGIC, 9, struct pico_reg)
 #endif
