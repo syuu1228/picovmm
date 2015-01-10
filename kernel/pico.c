@@ -39,8 +39,6 @@ MODULE_LICENSE("GPL");
 
 #define MINOR_COUNT 1
 
-#define NR_BAD_MSRS 2
-
 struct vmcs {
 	u32 revision_id;
 	u32 abort;
