@@ -4,7 +4,7 @@
 #include <asm/types.h>
 #include <linux/ioctl.h>
 
-enum {
+enum vcpu_regs {
 	VCPU_REGS_RAX = 0,
 	VCPU_REGS_RCX = 1,
 	VCPU_REGS_RDX = 2,
