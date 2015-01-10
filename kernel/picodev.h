@@ -1,5 +1,5 @@
-#ifndef PICO_H
-#define PICO_H
+#ifndef PICODEV_H
+#define PICODEV_H
 
 #include <asm/types.h>
 #include <linux/ioctl.h>

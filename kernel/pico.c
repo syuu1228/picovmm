@@ -30,7 +30,7 @@
 #include <asm/processor-flags.h>
 #include <asm/msr-index.h>
 #include <asm/uaccess.h>
-#include "pico.h"
+#include "picodev.h"
 #include "vmx.h"
 
 MODULE_AUTHOR("Takuya ASADA");
