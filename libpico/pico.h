@@ -16,7 +16,5 @@ uint64_t pico_reg_read(pico_handle_t handle, enum vcpu_regs index);
 void pico_reg_write(pico_handle_t handle, enum vcpu_regs index, unsigned long value);
 uint64_t pico_creg_read(pico_handle_t handle, int index);
 void pico_creg_write(pico_handle_t handle,  int index, unsigned long value);
-uint64_t pico_rdmsr(pico_handle_t handle, uint32_t index);
-void pico_wrmsr(pico_handle_t handle,  uint32_t index, unsigned long value);
 
 #endif

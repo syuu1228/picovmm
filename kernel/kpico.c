@@ -521,32 +521,6 @@ static long pico_dev_ioctl(struct file *filp,
 		r = 0;
 		break;
 	}
-	case PICO_RDMSR: {
-		struct pico_reg reg;
-
-		r = -EFAULT;
-		if (copy_from_user(&reg, (void *)arg, sizeof reg))
-			goto out;
-		rdmsrl(reg.field, reg.value);
-		r = -EFAULT;
-		if (copy_to_user((void *)arg, &reg, sizeof reg))
-			goto out;
-		r = 0;
-		break;
-	}
-	case PICO_WRMSR: {
-		struct pico_reg reg;
-
-		r = -EFAULT;
-		if (copy_from_user(&reg, (void *)arg, sizeof reg))
-			goto out;
-		wrmsrl(reg.field, reg.value);
-		r = -EFAULT;
-		if (copy_to_user((void *)arg, &reg, sizeof reg))
-			goto out;
-		r = 0;
-		break;
-	}
 
 	}
 out:

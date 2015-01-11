@@ -95,24 +95,3 @@ void pico_creg_write(pico_handle_t handle,  int index, unsigned long value)
 	assert(ret);
 }
 
-uint64_t pico_rdmsr(pico_handle_t handle, uint32_t index)
-{
-	struct pico_reg reg;
-	int ret;
-
-	reg.field = index;
-	ret = ioctl(handle, PICO_RDMSR, &reg);
-	assert(ret);
-	return reg.value;
-}
-
-void pico_wrmsr(pico_handle_t handle,  uint32_t index, unsigned long value)
-{
-	struct pico_reg reg;
-	int ret;
-
-	reg.field = index;
-	reg.value = value;
-	ret = ioctl(handle, PICO_WRMSR, &reg);
-	assert(ret);
-}
