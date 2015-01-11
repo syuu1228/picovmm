@@ -365,6 +365,9 @@ static int pico_dev_ioctl_vmentry(struct vcpu_state *vcpu)
 		"vmlaunch \n\t"
 		"jmp pico_vmx_return \n\t"
 		"launched: vmresume \n\t"
+		".globl pico_guest\n\t"
+		"pico_guest: "
+		"cpuid\n\t"
 		".globl pico_vmx_return \n\t"
 		"pico_vmx_return: "
 		/* Save guest registers, load host registers, keep flags */
@@ -591,6 +594,7 @@ static struct file_operations pico_file_ops = {
 static void vmcs_init_state(void)
 {
 	extern asmlinkage void pico_vmx_return(void);
+	extern asmlinkage void pico_guest(void);
 	u32 host_sysenter_cs;
 	u32 junk;
 	unsigned long a;
@@ -642,7 +646,7 @@ static void vmcs_init_state(void)
 	vmcs_writel(GUEST_SYSENTER_EIP, 0);
 
 	vmcs_writel(GUEST_RFLAGS, 0x02);
-	vmcs_writel(GUEST_RIP, 0);
+	vmcs_writel(GUEST_RIP, (unsigned long)pico_guest);
 	vmcs_writel(GUEST_RSP, 0);
 
 	vmcs_writel(GUEST_CR3, read_cr3());
