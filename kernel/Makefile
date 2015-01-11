@@ -2,7 +2,7 @@ KERNELDIR ?= /lib/modules/$(shell uname -r)/build
 PWD       := $(shell pwd)
 EXTRA_CFLAGS := -I$(PWD)/../libpico
 
-obj-m	:= kpico.o
+obj-m	:= pico.o
 
 default:
 	$(MAKE) -C $(KERNELDIR) M=$(PWD) EXTRA_CFLAGS=$(EXTRA_CFLAGS) modules
