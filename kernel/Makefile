@@ -1,9 +1,10 @@
-obj-m	:= pico.o
-
 KERNELDIR ?= /lib/modules/$(shell uname -r)/build
 PWD       := $(shell pwd)
+EXTRA_CFLAGS := -I$(PWD)/../libpico
+
+obj-m	:= kpico.o
 
 default:
-	$(MAKE) -C $(KERNELDIR) M=$(PWD) LDDINCDIR=$(PWD)/../include modules
+	$(MAKE) -C $(KERNELDIR) M=$(PWD) EXTRA_CFLAGS=$(EXTRA_CFLAGS) modules
 clean:
 	rm -rf *.o .*.cmd *.ko *.mod.c Module.symvers modules.order .tmp_versions
