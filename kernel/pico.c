@@ -39,6 +39,26 @@ MODULE_LICENSE("GPL");
 
 #define MINOR_COUNT 1
 
+#define CR0_PE_MASK (1ULL << 0)
+#define CR0_TS_MASK (1ULL << 3)
+#define CR0_NE_MASK (1ULL << 5)
+#define CR0_WP_MASK (1ULL << 16)
+#define CR0_NW_MASK (1ULL << 29)
+#define CR0_CD_MASK (1ULL << 30)
+#define CR0_PG_MASK (1ULL << 31)
+
+#define GUEST_CR0_MASK \
+	(CR0_PG_MASK | CR0_PE_MASK | CR0_WP_MASK | CR0_NE_MASK)
+
+#define CR4_VME_MASK (1ULL << 0)
+#define CR4_PSE_MASK (1ULL << 4)
+#define CR4_PAE_MASK (1ULL << 5)
+#define CR4_PGE_MASK (1ULL << 7)
+#define CR4_VMXE_MASK (1ULL << 13)
+
+#define GUEST_CR4_MASK \
+	(CR4_PSE_MASK | CR4_PAE_MASK | CR4_PGE_MASK | CR4_VMXE_MASK | CR4_VME_MASK)
+
 struct vmcs {
 	u32 revision_id;
 	u32 abort;
@@ -197,9 +217,25 @@ static inline void vmcs_write64(unsigned long field, u64 value)
 	vmcs_writel(field, value);
 }
 
+static void vmcs_write32_fixedbits(u32 msr, u32 vmcs_field, u32 val)
+{
+	u32 msr_high, msr_low;
+
+	rdmsr(msr, msr_low, msr_high);
+
+	val &= msr_high;
+	val |= msr_low;
+	vmcs_write32(vmcs_field, val);
+}
+
 static inline void get_gdt(struct descriptor_table *table)
 {
 	asm ("sgdt %0" : "=m"(*table));
+}
+
+static inline void get_idt(struct descriptor_table *table)
+{
+	asm ("sidt %0" : "=m"(*table));
 }
 
 static inline u16 read_fs(void)
@@ -552,6 +588,167 @@ static struct file_operations pico_file_ops = {
 	.mmap           = pico_dev_mmap,
 };
 
+static void vmcs_init_state(void)
+{
+	extern asmlinkage void pico_vmx_return(void);
+	u32 host_sysenter_cs;
+	u32 junk;
+	unsigned long a;
+	struct descriptor_table dt;
+	u64 tsc;
+
+	vmcs_write16(GUEST_CS_SELECTOR, __KERNEL_CS);
+	vmcs_writel(GUEST_CS_BASE, 0x0);
+	vmcs_write32(GUEST_CS_LIMIT, 0xffffffff);
+	vmcs_write32(GUEST_CS_AR_BYTES, 0x9b);
+
+	vmcs_write16(GUEST_DS_SELECTOR, __KERNEL_DS);
+	vmcs_writel(GUEST_DS_BASE, 0x0);
+	vmcs_write32(GUEST_DS_LIMIT, 0xffffffff);
+	vmcs_write32(GUEST_DS_AR_BYTES, 0x93);
+
+	vmcs_write16(GUEST_ES_SELECTOR, __KERNEL_DS);
+	vmcs_writel(GUEST_ES_BASE, 0x0);
+	vmcs_write32(GUEST_ES_LIMIT, 0xffffffff);
+	vmcs_write32(GUEST_ES_AR_BYTES, 0x93);
+
+	vmcs_write16(GUEST_FS_SELECTOR, read_fs());
+	vmcs_writel(GUEST_FS_BASE, 0x0);
+	vmcs_write32(GUEST_FS_LIMIT, 0xffffffff);
+	vmcs_write32(GUEST_FS_AR_BYTES, 0x93);
+
+	vmcs_write16(GUEST_GS_SELECTOR, read_gs());
+	vmcs_writel(GUEST_GS_BASE, 0x0);
+	vmcs_write32(GUEST_GS_LIMIT, 0xffffffff);
+	vmcs_write32(GUEST_GS_AR_BYTES, 0x93);
+
+	vmcs_write16(GUEST_SS_SELECTOR, __KERNEL_DS);
+	vmcs_writel(GUEST_SS_BASE, 0x0);
+	vmcs_write32(GUEST_SS_LIMIT, 0xffffffff);
+	vmcs_write32(GUEST_SS_AR_BYTES, 0x93);
+
+	vmcs_write16(GUEST_TR_SELECTOR, GDT_ENTRY_TSS*8);
+	vmcs_writel(GUEST_TR_BASE, 0);
+	vmcs_write32(GUEST_TR_LIMIT, 0xffffffff);
+	vmcs_write32(GUEST_TR_AR_BYTES, 0x008b);
+
+	vmcs_write16(GUEST_LDTR_SELECTOR, 0);
+	vmcs_writel(GUEST_LDTR_BASE, 0);
+	vmcs_write32(GUEST_LDTR_LIMIT, 0xffffffff);
+	vmcs_write32(GUEST_LDTR_AR_BYTES, 0x00082);
+
+	vmcs_write32(GUEST_SYSENTER_CS, 0);
+	vmcs_writel(GUEST_SYSENTER_ESP, 0);
+	vmcs_writel(GUEST_SYSENTER_EIP, 0);
+
+	vmcs_writel(GUEST_RFLAGS, 0x02);
+	vmcs_writel(GUEST_RIP, 0);
+	vmcs_writel(GUEST_RSP, 0);
+
+	vmcs_writel(GUEST_CR3, read_cr3());
+
+	//todo: dr0 = dr1 = dr2 = dr3 = 0; dr6 = 0xffff0ff0
+	vmcs_writel(GUEST_DR7, 0x400);
+
+	get_gdt(&dt);
+	vmcs_writel(GUEST_GDTR_BASE, dt.base);
+	vmcs_write32(GUEST_GDTR_LIMIT, dt.limit);
+
+	get_idt(&dt);
+	vmcs_writel(GUEST_IDTR_BASE, dt.base);
+	vmcs_write32(GUEST_IDTR_LIMIT, dt.limit);
+
+	vmcs_write32(GUEST_ACTIVITY_STATE, 0);
+	vmcs_write32(GUEST_INTERRUPTIBILITY_INFO, 0);
+	vmcs_write32(GUEST_PENDING_DBG_EXCEPTIONS, 0);
+
+	/* I/O */
+	vmcs_write64(IO_BITMAP_A, 0);
+	vmcs_write64(IO_BITMAP_B, 0);
+
+	rdtscll(tsc);
+	vmcs_write64(TSC_OFFSET, -tsc);
+
+	vmcs_write64(VMCS_LINK_POINTER, -1ull); /* 22.3.1.5 */
+
+	/* Special registers */
+	vmcs_write64(GUEST_IA32_DEBUGCTL, 0);
+
+	/* Control */
+	vmcs_write32_fixedbits(MSR_IA32_VMX_PINBASED_CTLS,
+			       PIN_BASED_VM_EXEC_CONTROL,
+			       PIN_BASED_EXT_INTR_MASK   /* 20.6.1 */
+			       | PIN_BASED_NMI_EXITING   /* 20.6.1 */
+			);
+	vmcs_write32_fixedbits(MSR_IA32_VMX_PROCBASED_CTLS,
+			       CPU_BASED_VM_EXEC_CONTROL,
+			       CPU_BASED_HLT_EXITING         /* 20.6.2 */
+			       | CPU_BASED_CR8_LOAD_EXITING    /* 20.6.2 */
+			       | CPU_BASED_CR8_STORE_EXITING   /* 20.6.2 */
+			       | CPU_BASED_UNCOND_IO_EXITING   /* 20.6.2 */
+			       | CPU_BASED_INVDPG_EXITING
+			       | CPU_BASED_MOV_DR_EXITING
+			       | CPU_BASED_USE_TSC_OFFSETING   /* 21.3 */
+			);
+
+	vmcs_write32(EXCEPTION_BITMAP, 0);
+	vmcs_write32(PAGE_FAULT_ERROR_CODE_MASK, 0);
+	vmcs_write32(PAGE_FAULT_ERROR_CODE_MATCH, 0);
+	vmcs_write32(CR3_TARGET_COUNT, 0);           /* 22.2.1 */
+
+	vmcs_writel(HOST_CR0, read_cr0());  /* 22.2.3 */
+	vmcs_writel(HOST_CR4, read_cr4());  /* 22.2.3, 22.2.5 */
+	vmcs_writel(HOST_CR3, read_cr3());  /* 22.2.3  FIXME: shadow tables */
+
+	vmcs_write16(HOST_CS_SELECTOR, __KERNEL_CS);  /* 22.2.4 */
+	vmcs_write16(HOST_DS_SELECTOR, __KERNEL_DS);  /* 22.2.4 */
+	vmcs_write16(HOST_ES_SELECTOR, __KERNEL_DS);  /* 22.2.4 */
+	vmcs_write16(HOST_FS_SELECTOR, read_fs());    /* 22.2.4 */
+	vmcs_write16(HOST_GS_SELECTOR, read_gs());    /* 22.2.4 */
+	vmcs_write16(HOST_SS_SELECTOR, __KERNEL_DS);  /* 22.2.4 */
+	rdmsrl(MSR_FS_BASE, a);
+	vmcs_writel(HOST_FS_BASE, a); /* 22.2.4 */
+	rdmsrl(MSR_GS_BASE, a);
+	vmcs_writel(HOST_GS_BASE, a); /* 22.2.4 */
+
+	vmcs_write16(HOST_TR_SELECTOR, GDT_ENTRY_TSS*8);  /* 22.2.4 */
+
+	get_idt(&dt);
+	vmcs_writel(HOST_IDTR_BASE, dt.base);   /* 22.2.4 */
+
+	vmcs_writel(HOST_RIP, (unsigned long)pico_vmx_return); /* 22.2.5 */
+
+	rdmsr(MSR_IA32_SYSENTER_CS, host_sysenter_cs, junk);
+	vmcs_write32(HOST_IA32_SYSENTER_CS, host_sysenter_cs);
+	rdmsrl(MSR_IA32_SYSENTER_ESP, a);
+	vmcs_writel(HOST_IA32_SYSENTER_ESP, a);   /* 22.2.3 */
+	rdmsrl(MSR_IA32_SYSENTER_EIP, a);
+	vmcs_writel(HOST_IA32_SYSENTER_EIP, a);   /* 22.2.3 */
+
+	vmcs_write32_fixedbits(MSR_IA32_VMX_EXIT_CTLS, VM_EXIT_CONTROLS,
+		     	       (1 << 9));  /* 22.2,1, 20.7.1 */
+	vmcs_write32(VM_EXIT_MSR_STORE_COUNT, 0); /* 22.2.2 */
+	vmcs_write32(VM_EXIT_MSR_LOAD_COUNT, 0);  /* 22.2.2 */
+	vmcs_write32(VM_ENTRY_MSR_LOAD_COUNT, 0); /* 22.2.2 */
+
+	/* 22.2.1, 20.8.1 */
+	vmcs_write32_fixedbits(MSR_IA32_VMX_ENTRY_CTLS,
+                               VM_ENTRY_CONTROLS, VM_ENTRY_CONTROLS_IA32E_MASK);
+	vmcs_write32(VM_ENTRY_INTR_INFO_FIELD, 0);  /* 22.2.1 */
+
+	vmcs_writel(VIRTUAL_APIC_PAGE_ADDR, 0);
+	vmcs_writel(TPR_THRESHOLD, 0);
+
+	vmcs_writel(CR0_GUEST_HOST_MASK, GUEST_CR0_MASK);
+	vmcs_writel(CR4_GUEST_HOST_MASK, GUEST_CR4_MASK);
+
+	vmcs_writel(CR0_READ_SHADOW, read_cr0());
+	vmcs_writel(GUEST_CR0, read_cr0());
+	vmcs_writel(CR4_READ_SHADOW, read_cr4());
+	vmcs_writel(GUEST_CR4, read_cr4());
+}
+
+
 static __init int cpu_has_vmx_support(void)
 {
 	unsigned long ecx = cpuid_ecx(1);
@@ -677,6 +874,10 @@ static __init int pico_init(void)
 		printk(KERN_ERR "pico: vcpu allocation failed\n");
 		goto err_vcpu;
 	}
+
+	vmptrld(vcpu0->vmcs);
+	vmcs_init_state();
+	vmclear(vcpu0->vmcs);
 
 	r = alloc_chrdev_region(&dev_id, 0, MINOR_COUNT, "pico");
 	if (r < 0) {
